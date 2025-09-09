@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+import subprocess
+
+def run(cmd: str) -> str:
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True)
+    except subprocess.CalledProcessError as e:
+        return e.output
+
+def get_staged_files():
+    output = run("git diff --cached --name-only").strip()
+    if not output:
+        return []
+    return output.splitlines()
+
+def get_diff_stats():
+    output = run("git diff --cached --numstat").strip()
+    stats = []
+    total_add = 0
+    total_del = 0
+    for line in output.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 3:
+            continue
+        added, deleted, filename = parts
+        try:
+            added = int(added)
+            deleted = int(deleted)
+        except ValueError:
+            continue
+        stats.append((filename, added, deleted))
+        total_add += added
+        total_del += deleted
+    return stats, total_add, total_del
+
+def main():
+    files = get_staged_files()
+    if not files:
+        print("스테이징된 변경사항이 없습니다.")
+        return
+    stats, total_add, total_del = get_diff_stats()
+    file_list = ', '.join(files)
+    basic_version = f"{file_list} 파일에 {total_add}줄 추가, {total_del}줄 삭제"
+    concise_version = f"{file_list} 업데이트"
+    feature_version = f"{file_list} 관련 기능 개선"
+    print("기본버전:", basic_version)
+    print("간결한 버전:", concise_version)
+    print("기능중심버전:", feature_version)
+
+if __name__ == "__main__":
+    main()
