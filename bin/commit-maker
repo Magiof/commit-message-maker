@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import subprocess
+import sys
+from typing import Dict, Optional, Tuple
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+import time
+
+
+APP_NAME = "commit-maker"
+DEFAULT_LANGUAGE = "ko"  # "ko" for Korean, "en" for English
+SECRET = "iw0Yvhx8MaTAxsOpIoMk2gGTdP43KPPNF9gRt1BK3u"
+
+
+def print_error(message: str) -> None:
+    print(f"[ERROR] {message}", file=sys.stderr)
+
+
+def print_info(message: str) -> None:
+    print(f"[INFO] {message}")
+
+
+def run_command(args: list[str]) -> Tuple[int, str, str]:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, check=False)
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        return 127, "", f"Command not found: {args[0]}"
+
+
+def assert_git_repo() -> bool:
+    code, out, _ = run_command(["git", "rev-parse", "--git-dir"])
+    return code == 0
+
+
+def get_staged_diff() -> str:
+    # Confirm there are staged changes
+    code, files_out, _ = run_command(["git", "diff", "--cached", "--name-only"])
+    if code != 0:
+        raise RuntimeError("git 명령어 실행에 실패했습니다. 깃 저장소인지 확인하세요.")
+    files = [line.strip() for line in files_out.splitlines() if line.strip()]
+    if not files:
+        raise RuntimeError(
+            "스테이징된 변경이 없습니다. 먼저 'git add'로 변경을 스테이징하세요."
+        )
+
+    # Get unified diff without color; keep context minimal to save tokens
+    code, diff_out, _ = run_command(
+        [
+            "git",
+            "diff",
+            "--cached",
+            "--unified=0",
+            "--no-color",
+        ]
+    )
+    if code != 0:
+        raise RuntimeError("git diff 실행에 실패했습니다.")
+    return diff_out
+
+
+# build_prompt removed (proxy constructs prompt)
+
+
+# local model call removed (proxy-only mode)
+
+
+def truncate_for_model(text: str, max_chars: int = 20000) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = text[: max_chars // 2]
+    tail = text[-max_chars // 2 :]
+    return head + "\n...\n[truncated]...\n...\n" + tail
+
+
+def call_proxy_service(proxy_url: str, diff_text: str) -> Dict[str, str]:
+    payload = {
+        "secret": SECRET,
+        "diff": diff_text,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    attempts = 0
+    max_attempts = 3
+    last_error_body = ""
+    while attempts < max_attempts:
+        attempts += 1
+        req = Request(proxy_url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urlopen(req, timeout=60) as resp:
+                resp_body = resp.read().decode("utf-8")
+            break
+        except HTTPError as e:
+            body = (
+                e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+            )
+            last_error_body = body
+            if e.code in (429, 500, 502, 503, 504) and attempts < max_attempts:
+                time.sleep(min(2 ** (attempts - 1), 5))
+                continue
+            raise RuntimeError(f"프록시 API 오류: HTTP {e.code} {body}")
+        except URLError as e:
+            if attempts < max_attempts:
+                time.sleep(min(2 ** (attempts - 1), 5))
+                continue
+            raise RuntimeError(f"프록시 API 연결 실패: {e}")
+
+    try:
+        obj = json.loads(resp_body)
+        return {
+            "자세하게": str(obj.get("detailed", "")).strip(),
+            "간결하게": str(obj.get("concise", "")).strip(),
+            "기능중심으로": str(obj.get("feature", "")).strip(),
+        }
+    except Exception as e:
+        preview = (
+            (resp_body or last_error_body)[:500]
+            if (resp_body or last_error_body)
+            else ""
+        )
+        raise RuntimeError(f"프록시 응답 파싱 실패: {e}\n원본: {preview}...")
+
+
+def prompt_and_commit(message: str) -> int:
+    print()
+    print("다음 명령을 실행합니다:")
+    print(f'git commit -m "{message}"')
+    try:
+        input("Enter 키를 누르면 커밋을 진행합니다 (취소하려면 Ctrl-C): ")
+    except KeyboardInterrupt:
+        print("\n취소되었습니다.")
+        return 130
+    # Execute commit without shell to avoid quoting issues
+    code, out, err = run_command(["git", "commit", "-m", message])
+    if code != 0:
+        print_error(err.strip() or "git commit 실패")
+        return code
+    print(out)
+    return 0
+
+
+def generate_and_interact(language: str) -> int:
+    if not assert_git_repo():
+        print_error("현재 디렉토리는 깃 저장소가 아닙니다.")
+        return 1
+    try:
+        diff_text = get_staged_diff()
+    except RuntimeError as e:
+        print_error(str(e))
+        return 1
+
+    clipped = truncate_for_model(diff_text)
+    # 프록시 전용 모드에서는 서버가 프롬프트를 구성하므로 로컬 프롬프트는 생성하지 않음
+    print_info("LLM에 커밋 메시지를 요청 중...")
+    proxy_url = (
+        "https://gkfiv3fe6ldxs2wm6v4vr6cnxi0zimnm.lambda-url.ap-northeast-2.on.aws/"
+    )
+
+    try:
+        suggestions = call_proxy_service(proxy_url, clipped)
+    except RuntimeError as e:
+        print_error(str(e))
+        return 1
+
+    options = [
+        (
+            "상세한 버전" if language == "ko" else "Detailed",
+            suggestions.get("자세하게", "") or suggestions.get("detailed", ""),
+        ),
+        (
+            "간결한 버전" if language == "ko" else "Concise",
+            suggestions.get("간결하게", "") or suggestions.get("concise", ""),
+        ),
+        (
+            "기능중심 버전" if language == "ko" else "Feature-focused",
+            suggestions.get("기능중심으로", "") or suggestions.get("feature", ""),
+        ),
+    ]
+
+    print()
+    print("제안된 커밋 메시지:")
+    for idx, (label, msg) in enumerate(options, start=1):
+        print(f" {idx}. [{label}] {msg}")
+
+    print()
+    try:
+        selection = input("원하는 번호를 입력하세요 (1/2/3): ").strip()
+    except KeyboardInterrupt:
+        print("\n취소되었습니다.")
+        return 130
+
+    if selection not in {"1", "2", "3"}:
+        print_error("올바른 번호가 아닙니다. 작업을 취소합니다.")
+        return 1
+
+    chosen = options[int(selection) - 1][1]
+    if not chosen:
+        print_error("선택된 메시지가 비어 있습니다.")
+        return 1
+    return prompt_and_commit(chosen)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="LLM 기반 커밋 메시지 제안 및 커밋 도우미 (Groq)",
+    )
+
+    # default generation options on root parser
+    parser.add_argument(
+        "-e",
+        action="store_true",
+        help="영어 버전 (English)",
+    )
+    parser.add_argument(
+        "-k",
+        action="store_true",
+        help="한글 버전 (Korean, default)",
+    )
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # language selection
+    language = DEFAULT_LANGUAGE
+    if getattr(args, "e", False):
+        language = "en"
+    elif getattr(args, "k", False):
+        language = "ko"
+
+    return generate_and_interact(language)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
